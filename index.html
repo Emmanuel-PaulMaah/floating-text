@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AR Karaoke Text</title>
+  <style>
+    body { margin:0; overflow:hidden; }
+    #debug { position: fixed; top: 8px; left: 8px; padding: 4px 8px; background: rgba(0,0,0,.5); color: #fff; font: 12px/1 monospace; }
+  </style>
+</head>
+<body>
+  <div id="debug">tap to place text</div>
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+    // --- renderer + scene ---
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera();
+
+    // light so the plane isn’t dark (BasicMaterial ignores lights, so optional)
+    const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    scene.add(light);
+
+    // --- reticle for placement ---
+    const reticleGeo = new THREE.RingGeometry(0.07, 0.08, 32).rotateX(-Math.PI/2);
+    const reticleMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+    const reticle = new THREE.Mesh(reticleGeo, reticleMat);
+    reticle.matrixAutoUpdate = false;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // --- text helper: canvas -> texture plane ---
+    function makeTextPlane(text, { font = 'bold 64px system-ui', padding = 24, bg = 'transparent', fg = '#ffffff' } = {}) {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      ctx.font = font;
+      const metrics = ctx.measureText(text);
+      const textW = Math.ceil(metrics.width);
+      const textH = Math.ceil(metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent);
+      canvas.width = textW + padding * 2;
+      canvas.height = textH + padding * 2;
+
+      // reapply font after resizing
+      const ctx2 = canvas.getContext('2d');
+      ctx2.font = font;
+      ctx2.textBaseline = 'top';
+      if (bg !== 'transparent') {
+        ctx2.fillStyle = bg;
+        ctx2.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      ctx2.fillStyle = fg;
+      ctx2.fillText(text, padding, padding);
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.needsUpdate = true;
+      tex.colorSpace = THREE.SRGBColorSpace;
+
+      const aspect = canvas.width / canvas.height;
+      const HEIGHT_M = 0.12;                 // ~12 cm tall text block in world units
+      const WIDTH_M = HEIGHT_M * aspect;
+
+      const geo = new THREE.PlaneGeometry(WIDTH_M, HEIGHT_M);
+      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.userData._dispose = () => { tex.dispose(); geo.dispose(); mat.dispose(); };
+      return mesh;
+    }
+
+    // lyric text instance
+    let lyric = null;
+    function placeLyricAt(matrix) {
+      if (lyric) { scene.remove(lyric); lyric.userData._dispose?.(); lyric = null; }
+      lyric = makeTextPlane('Never gonna give you up', { font: 'bold 80px system-ui', fg: '#ffffff' });
+      lyric.matrixAutoUpdate = false;
+      lyric.matrix.copy(matrix);
+      // Nudge up so it floats slightly above the plane
+      const m = new THREE.Matrix4().makeTranslation(0, 0.02, 0);
+      lyric.matrix.premultiply(m);
+      // Face the camera: billboard. Extract position, then set lookAt.
+      const pos = new THREE.Vector3().setFromMatrixPosition(lyric.matrix);
+      lyric.lookAt(camera.position);
+      lyric.position.copy(pos);
+      lyric.updateMatrix();
+      scene.add(lyric);
+    }
+
+    // --- XR session with hit-test ---
+    let hitTestSource = null;
+    let localSpace = null;
+
+    const button = ARButton.createButton(renderer, {
+      requiredFeatures: ['hit-test']
+      // optionalFeatures: ['anchors', 'dom-overlay'],
+      // domOverlay: { root: document.body }
+    });
+    document.body.appendChild(button);
+
+    renderer.xr.addEventListener('sessionstart', async () => {
+      const session = renderer.xr.getSession();
+      const viewerSpace = await session.requestReferenceSpace('viewer');
+      localSpace = await session.requestReferenceSpace('local');
+      const hitSource = await session.requestHitTestSource({ space: viewerSpace });
+      hitTestSource = hitSource;
+
+      session.addEventListener('end', () => { hitTestSource = null; localSpace = null; });
+
+      // Place text on select
+      session.addEventListener('select', () => {
+        if (!reticle.visible) return;
+        placeLyricAt(reticle.matrix);
+      });
+    });
+
+    // --- render loop with hit testing ---
+    renderer.setAnimationLoop((timestamp, frame) => {
+      if (frame && hitTestSource && localSpace) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length) {
+          const pose = hitTestResults[0].getPose(localSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+        } else {
+          reticle.visible = false;
+        }
+      }
+
+      // Keep text facing the camera slightly each frame for readability
+      if (lyric) {
+        const pos = new THREE.Vector3().setFromMatrixPosition(lyric.matrix);
+        lyric.lookAt(camera.position);
+        lyric.position.copy(pos);
+        lyric.updateMatrix();
+      }
+
+      renderer.render(scene, camera);
+    });
+
+    // resize
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
